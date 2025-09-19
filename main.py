@@ -5,7 +5,7 @@ import numpy as np
 import random
 import threading
 import sys
-import select
+import msvcrt
 
 
 def get_drawing_area():
@@ -72,57 +72,52 @@ def create_hatching_pattern(img, draw_x1, draw_y1, draw_width, draw_height):
     """ハッチング/点描パターンを生成"""
     img_height, img_width = img.shape
 
-    # ガウシアンブラーで滑らかに
     blurred = cv2.GaussianBlur(img, (3, 3), 0)
 
-    # 描画点のリストを作成
-    drawing_points = []
+    scale = 3
+    target_w = max(1, int(draw_width // scale))
+    target_h = max(1, int(draw_height // scale))
 
-    # ブロックサイズ（解像度調整）
-    block_size = 8
+    resized = cv2.resize(blurred, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    work = resized.astype(np.float32) / 255.0
 
-    print("ハッチングパターンを生成中...")
+    for y in range(target_h - 1):
+        row = work[y]
+        for x in range(1, target_w - 1):
+            old = row[x]
+            new = 0.0 if old < 0.5 else 1.0
+            row[x] = new
+            err = old - new
+            work[y, x + 1] = np.clip(work[y, x + 1] + err * (7.0 / 16.0), 0.0, 1.0)
+            work[y + 1, x - 1] = np.clip(work[y + 1, x - 1] + err * (3.0 / 16.0), 0.0, 1.0)
+            work[y + 1, x] = np.clip(work[y + 1, x] + err * (5.0 / 16.0), 0.0, 1.0)
+            work[y + 1, x + 1] = np.clip(work[y + 1, x + 1] + err * (1.0 / 16.0), 0.0, 1.0)
 
-    for y in range(0, img_height, block_size):
-        for x in range(0, img_width, block_size):
-            # ブロック領域を取得
-            block = blurred[
-                y : min(y + block_size, img_height), x : min(x + block_size, img_width)
-            ]
+    binary = (work < 0.5).astype(np.uint8)
 
-            # ブロックの平均輝度を計算
-            brightness = np.mean(block)
+    def morton_code(ix: int, iy: int, bits: int) -> int:
+        code = 0
+        for b in range(bits):
+            code |= ((ix >> b) & 1) << (2 * b)
+            code |= ((iy >> b) & 1) << (2 * b + 1)
+        return code
 
-            # 暗いほど点を多く配置（0-255 → 0-8段階）
-            density = int((255 - brightness) / 255 * 8)
+    bits = max(target_w - 1, target_h - 1).bit_length()
+    points = []
+    for y in range(target_h):
+        row = binary[y]
+        for x in range(target_w):
+            if row[x] != 0:
+                px = draw_x1 + int(x * scale + scale * 0.5)
+                py = draw_y1 + int(y * scale + scale * 0.5)
+                sx = min(max(int((px - draw_x1) / draw_width * (img_width - 1)), 0), img_width - 1)
+                sy = min(max(int((py - draw_y1) / draw_height * (img_height - 1)), 0), img_height - 1)
+                brightness = float(img[sy, sx])
+                code = morton_code(x, y, bits)
+                points.append((code, px, py, brightness))
 
-            # エッジ検出で方向性を追加
-            if block.shape[0] > 1 and block.shape[1] > 1:
-                sobel_x = cv2.Sobel(block, cv2.CV_64F, 1, 0, ksize=3)
-                sobel_y = cv2.Sobel(block, cv2.CV_64F, 0, 1, ksize=3)
-                edge_strength = np.sqrt(sobel_x**2 + sobel_y**2)
-                avg_edge = np.mean(edge_strength)
-
-                # エッジが強い場所はより多くの点を配置
-                if avg_edge > 30:
-                    density = min(density + 3, 10)
-
-            # 密度に応じて点を配置
-            for _ in range(density):
-                # ブロック内のランダムな位置
-                dx = random.randint(0, block_size - 1)
-                dy = random.randint(0, block_size - 1)
-
-                # 実際の画像座標
-                img_x = x + dx
-                img_y = y + dy
-
-                # 描画範囲にスケール
-                scaled_x = draw_x1 + int((img_x / img_width) * draw_width)
-                scaled_y = draw_y1 + int((img_y / img_height) * draw_height)
-
-                drawing_points.append((scaled_x, scaled_y, brightness))
-
+    points.sort(key=lambda t: t[0])
+    drawing_points = [(px, py, brightness) for _, px, py, brightness in points]
     return drawing_points
 
 
@@ -216,7 +211,6 @@ elif mode == "2":
     preview_img = np.full((int(draw_height), int(draw_width), 3), 255, dtype=np.uint8)
 
     for start_x, start_y, end_x, end_y in strokes:
-        # 描画範囲内のストロークのみ描画
         rel_start_x = start_x - draw_x1
         rel_start_y = start_y - draw_y1
         rel_end_x = end_x - draw_x1
@@ -325,13 +319,13 @@ input_thread = None
 
 
 def input_listener():
-    """入力監視スレッド"""
+    """入力監視スレッド（Windows用）"""
     global stop_drawing
     try:
         while not stop_drawing:
-            if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-                line = input()
-                if line.strip() == "":  # Enterキーで中止
+            if msvcrt.kbhit():
+                key = msvcrt.getch()
+                if key == b'\r':  # Enterキーで中止
                     stop_drawing = True
                     print("\n描画を中止しています...")
                     pyautogui.mouseUp()  # マウスを離す
@@ -365,111 +359,107 @@ if mode == "1":
     # 連続描画モード（クリックし続ける）
     print(f"連続描画開始: {len(drawing_points)}点")
 
-    # 点を近い順にソートして効率的な描画パスを作成
-    def distance(p1, p2):
-        return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
-
-    # 最初の点から開始
     if drawing_points:
-        sorted_points = [drawing_points[0]]
-        remaining_points = drawing_points[1:]
+        pyautogui.mouseDown()
 
-        print("最適な描画パスを計算中...")
-        while remaining_points:
-            current_point = sorted_points[-1]
-            # 現在の点に最も近い点を見つける
-            closest_point = min(
-                remaining_points, key=lambda p: distance(current_point, p)
-            )
-            sorted_points.append(closest_point)
-            remaining_points.remove(closest_point)
-
-        # 連続描画を実行
-        pyautogui.mouseDown()  # 最初にマウスを押下
-
-        for i, (x, y, brightness) in enumerate(sorted_points):
-            # スペースキーチェック
+        prev_x = None
+        prev_y = None
+        total = len(drawing_points)
+        for i, (x, y, brightness) in enumerate(drawing_points):
             if check_stop():
                 break
 
             if i % 100 == 0:
-                print(f"描画進行: {i}/{len(sorted_points)}")
+                print(f"描画進行: {i}/{total}")
 
-            # 少しランダムな動きを追加（人間らしさ）
-            jitter_x = random.randint(-1, 1)
-            jitter_y = random.randint(-1, 1)
+            if prev_x is not None and abs(x - prev_x) <= 0 and abs(y - prev_y) <= 0:
+                continue
 
-            # マウスを押したまま移動
-            pyautogui.moveTo(x + jitter_x, y + jitter_y, duration=0.001)
+            pyautogui.moveTo(x, y, duration=0.0)
 
-            # 明度に応じて描画速度を調整
-            if brightness < 100:  # 暗い部分はゆっくり
-                time.sleep(0.003)
+            if brightness < 100:
+                time.sleep(0.0025)
             else:
-                time.sleep(0.001)
+                time.sleep(0.0008)
+
+            prev_x = x
+            prev_y = y
 
         if not stop_drawing:
-            pyautogui.mouseUp()  # 最後にマウスを離す
+            pyautogui.mouseUp()
 
 elif mode == "2":
     # ストロークモード（連続描画）
     print(f"ストローク描画開始: {len(strokes)}本")
 
-    # ストロークを連続的に描画するためにグループ化
-    stroke_groups = []
-    current_group = []
+    connect_threshold = 40.0
+    visited = [False] * len(strokes)
+    ordered_groups = []
 
-    print("ストロークをグループ化中...")
-    for i, stroke in enumerate(strokes):
-        if not current_group:
-            current_group = [stroke]
-        else:
-            # 前のストロークの終点と現在のストロークの開始点が近い場合は同じグループに
-            prev_end = current_group[-1][2:4]  # 前のストロークの終点
-            curr_start = stroke[0:2]  # 現在のストロークの開始点
-            distance = (
-                (prev_end[0] - curr_start[0]) ** 2 + (prev_end[1] - curr_start[1]) ** 2
-            ) ** 0.5
-
-            if distance < 30:  # 30ピクセル以内なら連続
-                current_group.append(stroke)
-            else:
-                # 新しいグループを開始
-                stroke_groups.append(current_group)
-                current_group = [stroke]
-
-    if current_group:
-        stroke_groups.append(current_group)
-
-    print(f"{len(stroke_groups)}個のストロークグループを作成")
-
-    # 各グループを連続描画
-    for group_idx, group in enumerate(stroke_groups):
-        # スペースキーチェック
-        if check_stop():
+    idx = 0
+    while idx < len(strokes):
+        try:
+            start_i = next(i for i, v in enumerate(visited) if not v)
+        except StopIteration:
             break
 
-        print(f"グループ {group_idx + 1}/{len(stroke_groups)} 描画中")
+        visited[start_i] = True
+        sx, sy, ex, ey = strokes[start_i]
+        group = [(sx, sy, ex, ey)]
+        current_x, current_y = ex, ey
 
-        if group:
-            # グループの最初のストロークの開始点に移動
-            first_stroke = group[0]
-            pyautogui.moveTo(first_stroke[0], first_stroke[1])
-            pyautogui.mouseDown()
+        while True:
+            best_j = -1
+            best_flip = False
+            best_dist = 1e12
 
-            # グループ内の全ストロークを連続描画
-            for stroke in group:
-                # スペースキーチェック
-                if check_stop():
-                    break
+            for j, v in enumerate(visited):
+                if v:
+                    continue
+                csx, csy, cex, cey = strokes[j]
+                d1 = ((current_x - csx) ** 2 + (current_y - csy) ** 2) ** 0.5
+                d2 = ((current_x - cex) ** 2 + (current_y - cey) ** 2) ** 0.5
+                if d1 < best_dist:
+                    best_dist = d1
+                    best_j = j
+                    best_flip = False
+                if d2 < best_dist:
+                    best_dist = d2
+                    best_j = j
+                    best_flip = True
 
-                start_x, start_y, end_x, end_y = stroke
-                pyautogui.moveTo(end_x, end_y, duration=0.005)
-                time.sleep(0.001)
+            if best_j == -1 or best_dist > connect_threshold:
+                break
 
-            if not stop_drawing:
-                pyautogui.mouseUp()
-            time.sleep(0.05)  # グループ間の短い休憩
+            visited[best_j] = True
+            nsx, nsy, nex, ney = strokes[best_j]
+            if best_flip:
+                nsx, nsy, nex, ney = nex, ney, nsx, nsy
+            group.append((nsx, nsy, nex, ney))
+            current_x, current_y = nex, ney
+
+        ordered_groups.append(group)
+        idx += 1
+
+    for group_idx, group in enumerate(ordered_groups):
+        if check_stop():
+            break
+        if not group:
+            continue
+        first_stroke = group[0]
+        pyautogui.moveTo(first_stroke[0], first_stroke[1])
+        pyautogui.mouseDown()
+
+        for stroke in group:
+            if check_stop():
+                break
+            start_x, start_y, end_x, end_y = stroke
+            pyautogui.moveTo(end_x, end_y, duration=0.004)
+            time.sleep(0.0008)
+
+        if not stop_drawing:
+            pyautogui.mouseUp()
+        time.sleep(0.03)
 
 else:
     # 従来の輪郭線描画
